@@ -115,9 +115,10 @@ static void disable_write_protection(void)
 	u32 value;
 
 	value = ioread32(base + _PHYINT);
+	/* bit1:WPVAL(0:RPC_WP#=H(Protect Disable),1:RPC_WP#=L(Protect Enable)) */
 	value &= ~BIT(1);
 	iowrite32(value, base + _PHYINT);
-	pr_debug("PHYINT = 0x%08x\n", ioread32(base + _PHYINT));
+	dev_dbg(dd->dev, "PHYINT = 0x%08x\n", ioread32(base + _PHYINT));
 }
 
 /* Issue a flash command */
@@ -208,17 +209,11 @@ static int __read_register_data(uint32_t addr, uint32_t *buf, uint32_t byte_coun
 	 *                                      Read/memory space/WrrapedBrst
 	 */
 	regmap_write(dd->regmap, _SMCMR, 0x00800000);
-	/*
-	 * ByteAddress(8bit) => WordAddress(16bit)
-	 */
+	/* ByteAddress(8bit) => WordAddress(16bit) */
 	regmap_write(dd->regmap, _SMADR, addr>>1);
-	/*
-	 * CA15-3(Reserved) = all 0
-	 */
+	/* CA15-3(Reserved) = all 0 */
 	regmap_write(dd->regmap, _SMOPR, 0x00000000);
-	/*
-	 *                           15 cycle dummy wait
-	 */
+	/* 15 cycle dummy wait */
 	regmap_write(dd->regmap, _SMDMCR, 0x0000000E);
 	/*
 	 * bit8 ADDRE  = 1 : Address DDR transfer
@@ -235,17 +230,17 @@ static int __read_register_data(uint32_t addr, uint32_t *buf, uint32_t byte_coun
 		regmap_write(dd->regmap, _SMENR, 0xA222D40C);
 		break;
 	case 8:
-	/*
-	 * bit31-30 CDB[1:0]   =   10 : 4bit width command
-	 * bit25-24 ADB[1:0]   =   10 : 4bit width address
-	 * bit17-16 SPIDB[1:0] =   10 : 4bit width transfer data
-	 * bit15    DME        =    1 : dummy cycle enable
-	 * bit14    CDE        =    1 : Command enable
-	 * bit12    OCDE       =    1 : Option Command enable
-	 * bit11-8  ADE[3:0]   = 0100 : ADR[23:0]output(24Bit Address)
-	 * bit7-4   OPDE[3:0]  = 0000 : Option data disable
-	 * bit3-0   SPIDE[3:0] = 1111 : 64bit transfer
-	 */
+		/*
+		* bit31-30 CDB[1:0]   =   10 : 4bit width command
+		* bit25-24 ADB[1:0]   =   10 : 4bit width address
+		* bit17-16 SPIDB[1:0] =   10 : 4bit width transfer data
+		* bit15    DME        =    1 : dummy cycle enable
+		* bit14    CDE        =    1 : Command enable
+		* bit12    OCDE       =    1 : Option Command enable
+		* bit11-8  ADE[3:0]   = 0100 : ADR[23:0]output(24Bit Address)
+		* bit7-4   OPDE[3:0]  = 0000 : Option data disable
+		* bit3-0   SPIDE[3:0] = 1111 : 64bit transfer
+		*/
 		regmap_write(dd->regmap, _SMENR, 0xA222D40F);
 		break;
 	default:
@@ -274,24 +269,33 @@ static int __read_register_data(uint32_t addr, uint32_t *buf, uint32_t byte_coun
 	 * 63..32 31...0
 	 */
 	switch (byte_count) {
+	case 2:
+		/* Read data[31:0] */
+		regmap_read(dd->regmap, _SMRDR0, buf);
+		*buf = (*buf >> 16) & 0xFFFF;
+		pr_debug("[%s:bytes:%d] buf: 0x%08x\n",
+			__func__, byte_count, *buf);
+		break;
+	case 4:
+		/* Read data[31:0] */
+		regmap_read(dd->regmap, _SMRDR0, buf);
+		pr_debug("[%s:bytes:%d] buf: 0x%08x\n",
+			__func__, byte_count, *buf);
+		break;
 	case 8:
 		/*  Read data[63:32] */
 		regmap_read(dd->regmap, _SMRDR0, buf+1);
 		/* Read data[31:0] */
 		regmap_read(dd->regmap, _SMRDR1, buf);
-		break;
-	case 4:
-		/* Read data[31:0] */
-		regmap_read(dd->regmap, _SMRDR0, buf);
-		break;
-	case 2:
+		pr_debug("[%s:bytes:%d] buf: 0x%08x, 0x%08x\n",
+			__func__, byte_count, *(buf+1), *buf);
 		break;
 	}
 
 	return 0;
 }
 
-static int __reset_to_read_mode(void)
+static int __set_address_map_mode_on_read(void)
 {
 	/* Reset / ASO Exit */
 	return issue_command(0x0, 0xF0);
@@ -306,6 +310,7 @@ static int __read_device_status(uint32_t *buf)
 	ret = issue_command(0x555, 0x70);
 	if (ret)
 		return -1;
+#if 0
 
 	ret = __read_register_data(0x0, tmpbuf, 8);
 	if (ret)
@@ -325,6 +330,14 @@ static int __read_device_status(uint32_t *buf)
 	}
 
 	return ret;
+#else
+	ret = __read_register_data(0x0, tmpbuf, 2);
+	*buf = be16_to_cpu(tmpbuf[0]);
+	if (*buf & BIT(7))
+		return 1; /* Ready */
+	else
+		return 0; /* Busy */
+#endif
 }
 
 static int __read_device_id(u32 *buf)
@@ -342,14 +355,13 @@ static int __read_device_id(u32 *buf)
 
 	for (addr = 0; addr < 16; addr += 8) {
 		ret = __read_register_data(addr, tmpbuf, 8);
-		pr_debug("BUF: 0x%08x, 0x%08x\n", tmpbuf[1], tmpbuf[0]);
 		if (addr == 0) {
 			*buf = (be16_to_cpu((tmpbuf[0] & 0xFFFF0000) >> 16) << 16) |
 				be16_to_cpu(tmpbuf[0] & 0x0000FFFF);
 		}
 	}
 
-	__reset_to_read_mode();
+	__set_address_map_mode_on_read();
 	return 0;
 }
 
@@ -358,8 +370,6 @@ static void __erase_sector(uint32_t sector_addr)
 	int i;
 	u32 status;
 
-	//issue_command(0x555, 0x71); /* Clear the device status, necessary? */
-
 	issue_command(0x555, 0xAA);
 	issue_command(0x2AA, 0x55);
 	issue_command(0x555, 0x80);
@@ -367,9 +377,12 @@ static void __erase_sector(uint32_t sector_addr)
 	issue_command(0x2AA, 0x55);
 	issue_command(sector_addr >> 1, 0x30); /* Problem!!! Why? Address ??? */
 
+	msleep(2000); /* just sleep 2 seconds */
+	return;
+
 	i = 0;
 	while (1) {
-		if (__read_device_status(&status) == 1) {
+		if (__read_device_status(&status) == 1) { /* Ready */
 			pr_debug("Done: status =  0x%x\n", status);
 			break;
 		}
@@ -531,12 +544,10 @@ static void __attribute__ ((unused)) program_word(uint32_t addr, uint32_t data)
 	pr_debug("Waiting ....\n");
 	for (i = 0; i < 10; i++) {
 		msleep(100);
-		if (__read_device_status(&status)) {
-			pr_warn("Reading the device status is failed.\n");
+		if (__read_device_status(&status) == 1) { /* Ready */
+			//pr_warn("Reading the device status is failed.\n");
 			break;
 		}
-		if ((status & BIT(7)) == BIT(7)) /* Ready ? */
-			break;
 	}
 	pr_debug("loop count i = %d\n", i);
 	if (i == 10) {
@@ -560,14 +571,21 @@ static int __attribute__ ((unused)) drvctrl_init(void)
 	iowrite32(0x33333333, io_base + 0x0300);
 	iowrite32(~0x33333337, io_base + 0x0000);
 	iowrite32(0x33333337, io_base + 0x0304);
-	for (i = 0x300; i < 0x360; i += 4) {
+	//for (i = 0x300; i < 0x360; i += 4) {
+	for (i = 0x300; i < 0x308; i += 4) {
 		pr_debug("DRVCTRL%d: 0x%08x\n", i >> 2, ioread32(io_base + i));
 	}
 
-	//iowrite32(~0x00000FFF, io_base + 0x0000);
-	//iowrite32(0x00000FFF, io_base + 0x0400);
+	iowrite32(~0x00000FFF, io_base + 0x0000);
+	iowrite32(0x00000FFF, io_base + 0x0400);
+#if 0	/* no change */
+	iowrite32(~0xCFFF9000, io_base + 0x0000);
+	iowrite32(0xCFFF9000, io_base + 0x0400);
+#endif
 	pr_debug("PUEN0: 0x%08x (Expected: 0x00000FFF)\n",
 		ioread32(io_base + 0x400));
+	iowrite32(~0x00005FFF, io_base + 0x0000);
+	iowrite32(0x00005FFF, io_base + 0x0440);
 	pr_debug("PUD0: 0x%08x (Expected: 0x00005FBF)\n",
 		ioread32(io_base + 0x440));
 
@@ -590,7 +608,7 @@ static ssize_t bootparam_show(struct device *dev,
 				char *buf)
 {
 	u32 value;
-	__reset_to_read_mode();
+	__set_address_map_mode_on_read();
 	if (__read_register_data(0x0, &value, 4))
 		return sprintf(buf, "INVALID");
 	return sprintf(buf, "0x%08x", value);
@@ -602,7 +620,7 @@ static ssize_t ipl_show(struct device *dev,
 {
 	u32 val;
 	int ret;
-	__reset_to_read_mode();
+	__set_address_map_mode_on_read();
 	ret = __read_register_data(0x0, &val, 4);
 	if (ret)
 		return sprintf(buf, "INVALID");
@@ -621,6 +639,8 @@ static ssize_t ipl_store(struct device *dev,
 		//erase_sector(0x0);
 		/* write_word(0x0, 0x0000) */
 	} else if (!strncmp(buf, "B", 1)) {
+		__set_address_map_mode_on_read();
+		//issue_command(0x555, 0x71); /* Clear the device status, necessary? */
 		__erase_sector(0x0);
 		/* write_word(0x0, 0x0001) */
 	} else {
@@ -629,14 +649,76 @@ static ssize_t ipl_store(struct device *dev,
 	return count;
 }
 
+#ifdef DEBUG
+static u32 __sector_addr = 0xffffffff;
+static ssize_t debug_show(struct device *dev,
+			struct device_attribute *attr,
+			char *buf)
+{
+	ssize_t written = 0;
+	u32 dyb;
+	u32 val;
+
+	if (__sector_addr == 0xffffffff) {
+		return sprintf(buf, "Sector Address: 0x%08x\n", __sector_addr);
+	}
+
+	written = sprintf(buf, "Sector Address: 0x%08x\n", __sector_addr);
+
+	/* read dyb */
+	issue_command(0x555, 0xAA);
+	issue_command(0x2AA, 0x55);
+	issue_command(0x555, 0xE0);
+	__read_register_data(__sector_addr, &dyb, 4);
+	issue_command(0x0, 0xF0);
+	written += sprintf(buf+written, "DYB = 0x%08x (Expected = 0xff)\n", dyb);
+
+	/* read SA Protection status */
+	issue_command(0x555, 0xAA);
+	issue_command(0x2AA, 0x55);
+	issue_command(0x555, 0xC0);
+	issue_command(0x0, 0x60);
+	__read_register_data(__sector_addr, &val, 4);
+	issue_command(0x0, 0xF0);
+	written += sprintf(buf+written, "SA Protection Status = 0x%08x"
+			"(Expected = b xxxx xxxx xxxx x111)\n", val);
+
+	/* Evaluate erase status */
+	issue_command(0x555, 0xD0);
+	__read_device_status(&val);
+	written += sprintf(buf+written, "Device Status = 0x%08x"
+			"(Expected = b 1xxx xxx0)\n", val);
+
+
+	return written;
+}
+
+static ssize_t debug_store(struct device *dev,
+				struct device_attribute *addr,
+				const char *buf,
+				size_t count)
+{
+	if (sscanf(buf, "%x", &__sector_addr) == -1)
+		return -EINVAL;
+
+	return count;
+}
+#endif
+
 static DEVICE_ATTR_RO(bootparam);
 static DEVICE_ATTR(ipl, 0660, ipl_show, ipl_store);
 static DEVICE_ATTR_RO(status);
+#ifdef DEBUG
+static DEVICE_ATTR(debug, 0660, debug_show, debug_store);
+#endif
 
 static struct attribute *hflash_attrs[] = {
 	&dev_attr_bootparam.attr,
 	&dev_attr_ipl.attr,
 	&dev_attr_status.attr,
+#ifdef DEBUG
+	&dev_attr_debug.attr,
+#endif
 	NULL
 };
 
@@ -654,7 +736,7 @@ static int __init hflash_init(void)
 	int ret;
 
 	/* Hardware configuration */
-#if 0
+#if 1
 	drvctrl_init(); /* Hardware configuration might be OK. */
 #endif
 
@@ -725,12 +807,12 @@ static void __exit hflash_exit(void)
 	struct hf_drvdata *dd = (struct hf_drvdata*)dev_get_drvdata(hflash_dev);
 
 	pr_debug("Removing the device ...\n");
-	if (dd->io_base) {
+	if (dd->io_base)
 		iounmap(dd->io_base);
-	}
 	sysfs_remove_group(&hflash_dev->kobj, &hflash_attr_group);
 	release_mem_region(RPCIF_BASE, RPCIF_SIZE);
-	root_device_unregister(hflash_dev);
+	if (hflash_dev)
+		root_device_unregister(hflash_dev);
 	pr_info("Bye!\n");
 }
 

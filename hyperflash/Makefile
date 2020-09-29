@@ -20,8 +20,5 @@ default:
 install:
 	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) INSTALL_MOD_PATH=$(DESTDIR) modules_install
 
-copy:
-	cp cogent.ko ipl-helper.ko /opt/devel/rootfs-rcar3/home/root
-
 clean:
 	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) clean
