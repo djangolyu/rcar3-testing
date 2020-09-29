@@ -71,6 +71,7 @@
 
 /* Driver data for Hyperbus flash memory */
 struct hf_drvdata {
+	struct device *dev;
 	void __iomem *io_base;
 	struct regmap *regmap;
 };
@@ -98,21 +99,6 @@ static const struct regmap_config rpcif_regmap_config = {
 };
 
 
-#if 0
-static void wait_for_end_of_tx(void)
-{
-	struct hf_drvdata *dd = (struct hf_drvdata*)dev_get_drvdata(hflash_dev);
-	int i;
-
-	for (i = 0; i < 10000; i++) {
-		if (ioread32(dd->io_base + _CMNSR) & BIT(0))
-			break;
-	}
-	pr_debug("\t\tRPC-IF TX count = %d\n", i);
-	if (i == 10000)
-		pr_warn("Waiting for end of TX might be failed.\n");
-}
-#else
 static int wait_msg_xfer_end(struct hf_drvdata *dd)
 {
 	u32 sts;
@@ -121,7 +107,6 @@ static int wait_msg_xfer_end(struct hf_drvdata *dd)
 					sts & BIT(0), 0,
 					USEC_PER_SEC);
 }
-#endif
 
 static void disable_write_protection(void)
 {
@@ -135,214 +120,268 @@ static void disable_write_protection(void)
 	pr_debug("PHYINT = 0x%08x\n", ioread32(base + _PHYINT));
 }
 
-/*
- * cnt: count in byte
- */
-static uint32_t read_hyperflash(uint32_t addr, uint32_t *buf, uint32_t cnt)
+/* Issue a flash command */
+static int issue_command(uint32_t addr, u16 cmd)
 {
 	struct hf_drvdata *dd = (struct hf_drvdata*)dev_get_drvdata(hflash_dev);
-	void __iomem *base = dd->io_base;
+	int ret;
 
-	iowrite32(0x00038263, base + _PHYCNT);
-	iowrite32(0x80038263, base + _PHYCNT);
-	iowrite32(0x81FFF301, base + _CMNCR);
-	iowrite32(0x00800000, base + _SMCMR);
-	iowrite32( (addr>>1), base + _SMADR);
-	iowrite32(0x00000000, base + _SMOPR);
-	iowrite32(0x0000000E, base + _SMDMCR);
-	iowrite32(0x00005101, base + _SMDRENR);
-
-	switch (cnt) {
-	case 2:
-		iowrite32(0xA222D408, base + _SMENR);
-		break;
-	case 4:
-		iowrite32(0xA222D40C, base + _SMENR);
-		break;
-	case 8:
-		iowrite32(0xA222D40F, base + _SMENR);
-		break;
-	default:
-		return -EINVAL;
-		break;
+	/* Set RPC-IF to manual mode, TEND bit must be 1 */
+	ret = wait_msg_xfer_end(dd);
+	if (ret) {
+		dev_dbg(dd->dev, "Failed to issue a command, errno = %d", ret);
+		return ret;
+	} else {
+		regmap_write(dd->regmap, _PHYCNT, 0x80038263);
+		regmap_write(dd->regmap, _CMNCR, 0x81FFF301);
 	}
 
-	iowrite32(0x00000005, base + _SMCR);
-
-	//wait_for_end_of_tx();
-	wait_msg_xfer_end(dd);
-
-	if (cnt == 8)
-		buf[1] = ioread32(base + _SMRDR0);
-	buf[0] = ioread32(base + _SMRDR1);
-
-	return buf[0];
-}
-
-/* Issue a flash command */
-/* data 16 bits, hyperbus: write to register space, CA[47:45] = b010 */
-static void issue_command(uint32_t addr, u16 cmd)
-{
-	struct hf_drvdata *dd = (struct hf_drvdata*)dev_get_drvdata(hflash_dev);
-
-	regmap_write(dd->regmap, _PHYCNT, 0x80038263);
-	regmap_write(dd->regmap, _CMNCR, 0x81FFF301);
-
-	regmap_write(dd->regmap, _SMCMR, 0x00400000); /* set CA47-45 */
-	regmap_write(dd->regmap, _SMDRENR, 0x00005101);
-	regmap_write(dd->regmap, _SMENR, 0xA2225408);
-
+	/*
+	 * Create Command-Address bits of Hyperbus
+	 * SL26K{L,S} doesn't care address space
+	 */
+	/* CA47-45 = 000 -> Write, memory space, wrapped Burst */
+	regmap_write(dd->regmap, _SMCMR, 0x00000000);
+	/* CA15-3(Reserved) = all 0 */
 	regmap_write(dd->regmap, _SMOPR, 0x00000000);
+	regmap_write(dd->regmap, _SMADR, addr);
+
+	/* There is no latency between Command-Address and Data */
+
+	/* Set up data being sent */
 	regmap_write(dd->regmap, _SMWDR1, 0x00000000);
 	regmap_write(dd->regmap, _SMWDR0, cpu_to_be16(cmd) << 16);
-	if (addr == 0x555 || addr == 0x2AA)
-		regmap_write(dd->regmap, _SMADR, addr);
-	else
-		regmap_write(dd->regmap, _SMADR, addr);
 
+	/*
+	 * Configure SoC for transmission
+	 */
+	/*
+	 * bit14-12 HYPE =101:Hyperflash mode
+	 * bit8 ADDRE  = 1 : Address DDR transfer
+	 * bit0 SPIDRE = 1 : DATA DDR transfer
+	 */
+	regmap_write(dd->regmap, _SMDRENR, 0x00005101);
+	/*
+	 * bit31-30 CDB[1:0]   =   10 : 4bit width command
+	 * bit25-24 ADB[1:0]   =   10 : 4bit width address
+	 * bit17-16 SPIDB[1:0] =   10 : 4bit width transfer data
+	 * bit15    DME        =    0 : dummy cycle disable
+	 * bit14    CDE        =    1 : Command enable
+	 * bit12    OCDE       =    1 : Option Command enable
+	 * bit11-8  ADE[3:0]   = 0100 : ADR[23:0] output (24 Bit Address)
+	 * bit7-4   OPDE[3:0]  = 0000 : Option data disable
+	 * bit3-0   SPIDE[3:0] = 1000 : 16bit transfer
+	 */
+	regmap_write(dd->regmap, _SMENR, 0xA2225408);
+
+	/*
+	 * bit2     SPIRE      = 0 : Data read disable
+	 * bit1     SPIWE      = 1 : Data write enable
+	 * bit0     SPIE       = 1 : SPI transfer start
+	 */
 	regmap_write(dd->regmap, _SMCR, 0x00000003);
 	pr_debug("\t\t[ADR:0x%08x, CMD:0x%08x] CMNSR = 0x%08x",
-			//addr, cpu_to_be32(cmd),
 			addr, cpu_to_be16(cmd) << 16,
 			ioread32(dd->io_base + _CMNSR));
 
-	wait_msg_xfer_end(dd);
+	return wait_msg_xfer_end(dd);
 }
 
-/* addr is word */
-static int read_4bytes(u32 addr, u32 *buf)
+static int __read_register_data(uint32_t addr, uint32_t *buf, uint32_t byte_count)
 {
 	struct hf_drvdata *dd = (struct hf_drvdata*)dev_get_drvdata(hflash_dev);
-	u32 value;
 	int ret;
 
-	regmap_write(dd->regmap, _PHYCNT, 0x00038263);
-	regmap_write(dd->regmap, _PHYCNT, 0x80038263);
+	/*
+	 * bit31  CAL         =  1 : PHY calibration
+	 * bit1-0 PHYMEM[1:0] = 11 : HyperFlash
+	 */
+	regmap_write(dd->regmap, _PHYCNT, 0x80000263);
+	/*
+	 * bit31  MD       =  1 : Manual mode
+	 * bit1-0 BSZ[1:0] = 01 : QSPI Flash x 2 or HyperFlash
+	 */
 	regmap_write(dd->regmap, _CMNCR, 0x81FFF301);
+
+	/*
+	 * bit23-21 CMD[7:5] = 100 : CA47-45 = 100 =>
+	 *                                      Read/memory space/WrrapedBrst
+	 */
 	regmap_write(dd->regmap, _SMCMR, 0x00800000);
-	/* word addressing, a word is 16 bits */
-	regmap_write(dd->regmap, _SMADR, addr>>1); /* Word addressing */
+	/*
+	 * ByteAddress(8bit) => WordAddress(16bit)
+	 */
+	regmap_write(dd->regmap, _SMADR, addr>>1);
+	/*
+	 * CA15-3(Reserved) = all 0
+	 */
 	regmap_write(dd->regmap, _SMOPR, 0x00000000);
+	/*
+	 *                           15 cycle dummy wait
+	 */
 	regmap_write(dd->regmap, _SMDMCR, 0x0000000E);
+	/*
+	 * bit8 ADDRE  = 1 : Address DDR transfer
+	 * bit0 SPIDRE = 1 : DATA DDR transfer
+	 */
 	regmap_write(dd->regmap, _SMDRENR, 0x00005101);
-	regmap_write(dd->regmap, _SMENR, 0xA222D40C);
+	switch (byte_count) {
+	case 2: /* Read 2 bytes */
+		/* bit3-0   SPIDE[3:0] = 1000 : 16bit transfer*/
+		regmap_write(dd->regmap, _SMENR, 0xA222D408);
+		break;
+	case 4: /* Read 4 bytes */
+		/* bit3-0   SPIDE[3:0] = 1100 : 32bit transfer */
+		regmap_write(dd->regmap, _SMENR, 0xA222D40C);
+		break;
+	case 8:
+	/*
+	 * bit31-30 CDB[1:0]   =   10 : 4bit width command
+	 * bit25-24 ADB[1:0]   =   10 : 4bit width address
+	 * bit17-16 SPIDB[1:0] =   10 : 4bit width transfer data
+	 * bit15    DME        =    1 : dummy cycle enable
+	 * bit14    CDE        =    1 : Command enable
+	 * bit12    OCDE       =    1 : Option Command enable
+	 * bit11-8  ADE[3:0]   = 0100 : ADR[23:0]output(24Bit Address)
+	 * bit7-4   OPDE[3:0]  = 0000 : Option data disable
+	 * bit3-0   SPIDE[3:0] = 1111 : 64bit transfer
+	 */
+		regmap_write(dd->regmap, _SMENR, 0xA222D40F);
+		break;
+	default:
+		dev_err(dd->dev, "Byte count is wrong. byte_count = %u\n", byte_count);
+		break;
+	}
+
+	/*
+	 * bit2     SPIRE      = 1 : Data read enable
+	 * bit1     SPIWE      = 0 : Data write disable
+	 * bit0     SPIE       = 1 : SPI transfer start
+	 */
 	regmap_write(dd->regmap, _SMCR, 0x00000005);
 
 	ret = wait_msg_xfer_end(dd);
-	if (ret)
-		return ret;
 
-	regmap_read(dd->regmap, _SMRDR0, &value);
-	//*buf = be32_to_cpu(value);
-	*buf = value;
+	if (ret) {
+		pr_debug("[%s]: error, timedout\n", __func__);
+		return -1;
+	}
+
+	/*
+	 * Big Endian
+	 * addr...addr+4
+	 * SMRDR0 SMRDR1
+	 * 63..32 31...0
+	 */
+	switch (byte_count) {
+	case 8:
+		/*  Read data[63:32] */
+		regmap_read(dd->regmap, _SMRDR0, buf+1);
+		/* Read data[31:0] */
+		regmap_read(dd->regmap, _SMRDR1, buf);
+		break;
+	case 4:
+		/* Read data[31:0] */
+		regmap_read(dd->regmap, _SMRDR0, buf);
+		break;
+	case 2:
+		break;
+	}
+
 	return 0;
 }
 
-/* hyperbus, read reg: CA[47:45] = b100 */
-static uint16_t read_2bytes_mem(uint32_t addr)
+static int __reset_to_read_mode(void)
 {
-	struct hf_drvdata *dd = (struct hf_drvdata*)dev_get_drvdata(hflash_dev);
-	u32 value;
-
-	regmap_write(dd->regmap, _PHYCNT, 0x00038263);
-	regmap_write(dd->regmap, _PHYCNT, 0x80038263);
-	regmap_write(dd->regmap, _CMNCR, 0x81FFF301);
-	regmap_write(dd->regmap, _SMCMR, 0x00800000);
-	/* word addressing, a word is 16 bits */
-	regmap_write(dd->regmap, _SMADR, addr);
-	regmap_write(dd->regmap, _SMOPR, 0x00000000);
-	regmap_write(dd->regmap, _SMDMCR, 0x0000000E);
-	regmap_write(dd->regmap, _SMDRENR, 0x00005101);
-	regmap_write(dd->regmap, _SMENR, 0xA222D408);
-	regmap_write(dd->regmap, _SMCR, 0x00000005);
-
-	wait_msg_xfer_end(dd);
-
-	/*
-	 * Big Endian
-	 * addr...addr+4
-	 * SMRDR0 SMRDR1
-	 * 63..32 31...0
-	 */
-	regmap_read(dd->regmap, _SMRDR0, &value);
-	//return be32_to_cpu(value) & 0xFFFF;
-	return (value >> 16) & 0xFFFF;
+	/* Reset / ASO Exit */
+	return issue_command(0x0, 0xF0);
 }
 
-/* hyperbus, read reg: CA[47:45] = b110 */
-static u16 read_2bytes_reg(uint32_t addr)
+static int __read_device_status(uint32_t *buf)
 {
-	struct hf_drvdata *dd = (struct hf_drvdata*)dev_get_drvdata(hflash_dev);
-	u32 value;
+	uint32_t tmpbuf[2];
+	uint32_t ret;
 
-	regmap_write(dd->regmap, _PHYCNT, 0x00038263);
-	regmap_write(dd->regmap, _PHYCNT, 0x80038263);
-	regmap_write(dd->regmap, _CMNCR, 0x81FFF301);
-	regmap_write(dd->regmap, _SMCMR, 0x00c00000);
-	/* word addressing, a word is 16 bits */
-	regmap_write(dd->regmap, _SMADR, addr);
-	regmap_write(dd->regmap, _SMOPR, 0x00000000);
-	regmap_write(dd->regmap, _SMDMCR, 0x0000000E);
-	regmap_write(dd->regmap, _SMDRENR, 0x00005101);
-	regmap_write(dd->regmap, _SMENR, 0xA222D408);
-	regmap_write(dd->regmap, _SMCR, 0x00000005);
+	/* 1st command write */
+	ret = issue_command(0x555, 0x70);
+	if (ret)
+		return -1;
 
-	wait_msg_xfer_end(dd);
+	ret = __read_register_data(0x0, tmpbuf, 8);
+	if (ret)
+		return -2;
 
-	/*
-	 * Big Endian
-	 * addr...addr+4
-	 * SMRDR0 SMRDR1
-	 * 63..32 31...0
-	 */
-	regmap_read(dd->regmap, _SMRDR0, &value);
-	//return be32_to_cpu(value) & 0xFFFF;
-	return be16_to_cpu((value >> 16) & 0xFFFF);
+	*buf = (be16_to_cpu((tmpbuf[0] & 0xFFFF0000) >> 16) << 16) |
+		be16_to_cpu(tmpbuf[0] & 0x0000FFFF);
+
+	*buf = (*buf & 0x0000FFFFU);
+
+	if ((*buf & BIT(7)) != 0U) {
+		//ret = FL_DEVICE_READY;
+		ret = 1;
+	} else {
+		//ret = FL_DEVICE_BUSY;
+		ret = 0;
+	}
+
+	return ret;
 }
 
-static uint32_t read_8bytes(uint32_t addr, uint32_t *buf)
+static int __read_device_id(u32 *buf)
 {
-	struct hf_drvdata *dd = (struct hf_drvdata*)dev_get_drvdata(hflash_dev);
-	void __iomem *base = dd->io_base;
+	u32 tmpbuf[2];
+	u32 addr;
+	int ret;
 
-	iowrite32(0x00038263, base + _PHYCNT);
-	iowrite32(0x80038263, base + _PHYCNT);
-	iowrite32(0x81FFF301, base + _CMNCR);
-	iowrite32(0x00800000, base + _SMCMR);
-	iowrite32((addr>>1), base + _SMADR);
-	iowrite32(0x00000000, base + _SMOPR);
-	iowrite32(0x0000000E, base + _SMDMCR);
-	iowrite32(0x00005101, base + _SMDRENR);
-	iowrite32(0xA222D40F, base + _SMENR);
-	iowrite32(0x00000005, base + _SMCR);
+	ret = issue_command(0x555, 0xAA);
+	if (ret) return -1;
+	ret = issue_command(0x2AA, 0x55);
+	if (ret) return -1;
+	ret = issue_command(0x555, 0x90);
+	if (ret) return -1;
 
-	//wait_for_end_of_tx();
-	wait_msg_xfer_end(dd);
+	for (addr = 0; addr < 16; addr += 8) {
+		ret = __read_register_data(addr, tmpbuf, 8);
+		pr_debug("BUF: 0x%08x, 0x%08x\n", tmpbuf[1], tmpbuf[0]);
+		if (addr == 0) {
+			*buf = (be16_to_cpu((tmpbuf[0] & 0xFFFF0000) >> 16) << 16) |
+				be16_to_cpu(tmpbuf[0] & 0x0000FFFF);
+		}
+	}
 
-	buf[1] = ioread32(base + _SMRDR0);
-	buf[0] = ioread32(base + _SMRDR1);
-
-	//pr_debug("%s: buf[1] = 0x%08x, buf[0] = 0x%08x\n", __func__, buf[1], buf[0]);
-
-	return buf[0];
+	__reset_to_read_mode();
+	return 0;
 }
 
-static uint32_t __attribute__ ((unused)) read_flash_id(void)
+static void __erase_sector(uint32_t sector_addr)
 {
-	uint32_t buf[2];
+	int i;
+	u32 status;
 
-	issue_command(HYPER_FL_UNLOCK1_ADD, HYPER_FL_UNLOCK1_DATA);
-	issue_command(HYPER_FL_UNLOCK2_ADD, HYPER_FL_UNLOCK2_DATA);
-	issue_command(HYPER_FL_UNLOCK3_ADD, HYPER_FL_ID_ENTRY_COM);
+	//issue_command(0x555, 0x71); /* Clear the device status, necessary? */
 
-	read_hyperflash(0, buf, 8);
-	pr_debug("0x%08x, 0x%08x\n", buf[1], buf[0]);
+	issue_command(0x555, 0xAA);
+	issue_command(0x2AA, 0x55);
+	issue_command(0x555, 0x80);
+	issue_command(0x555, 0xAA);
+	issue_command(0x2AA, 0x55);
+	issue_command(sector_addr >> 1, 0x30); /* Problem!!! Why? Address ??? */
 
-	issue_command(0x0, HYPER_FL_RESET_COM);
-
-	return buf[0];
+	i = 0;
+	while (1) {
+		if (__read_device_status(&status) == 1) {
+			pr_debug("Done: status =  0x%x\n", status);
+			break;
+		}
+		pr_debug("status =  0x%x\n", status);
+		msleep(50);
+		if (i++ == 10) {
+			issue_command(0x0, HYPER_FL_RESET_COM);
+			break;
+		}
+	}
+	pr_debug("End of waiting for the status bit. count = %d\n", i);
 }
-
 
 static int reset_rpc(void)
 {
@@ -426,7 +465,6 @@ static int power_on_rpc_module(void)
 	}
 }
 
-
 static void __attribute__ ((unused)) dump_flash_memory(void)
 {
 	void __iomem *io_base;
@@ -456,76 +494,6 @@ static void __attribute__ ((unused)) dump_flash_memory(void)
 	iounmap(io_base);
 }
 
-static u16 read_status_mine(void)
-{
-	issue_command(0x555, 0x70);
-	return read_2bytes_reg(0x0);
-}
-
-static uint32_t read_status_renesas(void)
-{
-	uint32_t buf[2];
-	uint32_t status;
-
-	issue_command(0x555, 0x70);
-
-	status = read_8bytes(0x0, buf);
-
-	return (((status & 0xFF000000) >> 8 ) |
-		((status & 0x00FF0000) << 8 ) |
-		((status & 0x0000FF00) >> 8 ) |
-		((status & 0x000000FF) << 8 )) & 0x0000FFFF;
-}
-
-/* Send data to a flash chip. data is stored in the hardware buf */
-static void _send_data_from_hwbuf(void)
-{
-	struct hf_drvdata *dd = (struct hf_drvdata*)dev_get_drvdata(hflash_dev);
-	void __iomem *base = dd->io_base;
-	void __iomem *buf;
-	uint32_t addr = 0x0 >> 1;
-	int i;
-
-	buf = ioremap_nocache(RPCIF_WRBUF_BASE, RPCIF_WRBUF_SIZE);
-	if (buf == NULL) {
-		pr_err("Failed to map the hardware buffer.\n");
-		return;
-	}
-
-	iowrite32(0x011F0301, base + _DRCR); /* Clear read cache */
-	iowrite32(0x80038277, base + _PHYCNT);
-
-	for (i = 0; i < RPCIF_WRBUF_SIZE; i += 4) {
-		iowrite32(0x5a5a5a5a, buf + i);
-	}
-
-	iowrite32(0x81FFF301, base + _CMNCR);
-	iowrite32(0x00000000, base + _SMCMR);
-	iowrite32(addr, base + _SMADR);
-	iowrite32(0x00000000, base + _SMOPR);
-	iowrite32(0x00005101, base + _SMDRENR);
-	iowrite32(0xA222540F, base + _SMENR);
-	iowrite32(0x00000003, base + _SMCR);
-
-	//wait_for_end_of_tx();
-	wait_msg_xfer_end(dd);
-
-	iowrite32(0x00038273, base + _PHYCNT);
-	iowrite32(0x011F0301, base + _DRCR);
-
-	iounmap(buf);
-}
-
-static void write_hwbuf(void)
-{
-	issue_command(0x00000555, 0xAA);
-	issue_command(0x000002AA, 0x55);
-	issue_command(0x00000555, 0xA0);
-
-	issue_command(0x0, 0x51);
-	//_send_data_from_hwbuf();
-}
-
 static void _send_word(uint32_t addr, uint32_t data)
 {
 	struct hf_drvdata *dd = (struct hf_drvdata*)dev_get_drvdata(hflash_dev);
@@ -550,6 +518,7 @@ static void _send_word(uint32_t addr, uint32_t data)
 static void __attribute__ ((unused)) program_word(uint32_t addr, uint32_t data)
 {
 	int i;
+	u32 status;
 
 	disable_write_protection();
 
@@ -562,100 +531,18 @@ static void __attribute__ ((unused)) program_word(uint32_t addr, uint32_t data)
 	pr_debug("Waiting ....\n");
 	for (i = 0; i < 10; i++) {
 		msleep(100);
-		if ((read_status_renesas() & BIT(7)) == BIT(7))
+		if (__read_device_status(&status)) {
+			pr_warn("Reading the device status is failed.\n");
+			break;
+		}
+		if ((status & BIT(7)) == BIT(7)) /* Ready ? */
 			break;
 	}
 	pr_debug("loop count i = %d\n", i);
 	if (i == 10) {
 		pr_warn("Reading status bits might be failed. status = 0x%08x\n",
-			read_status_renesas());
+			status);
 	}
-}
-
-static void dump_first_16bytes(void)
-{
-	uint32_t buf[4];
-	int i;
-	//read_hyperflash(0x0, buf, 4);
-	//pr_debug("0x0000: 0x%08x\n", buf[0]);
-
-#if 0
-	issue_command(0x00000000, &buf[0]);
-	read_hyperflash(0x0, buf, 4);
-	pr_debug("0x0000: 0x%08x\n", buf[0]);
-#endif
-	//issue_command(0x0, HYPER_FL_RESET_COM);
-	//issue_command(0x0, 0xFF000000);
-	//issue_command(0x555, 0x71000000);
-	//issue_command(0x00000000, &buf[0]);
-
-	read_8bytes(0x0, buf);
-	pr_debug("8:0x0000: 0x%08x\n", buf[0]);
-	read_8bytes(0xd54, buf);
-	pr_debug("8:0x0D54: 0x%08x\n", buf[0]);
-
-	issue_command(0x0, HYPER_FL_RESET_COM);
-	pr_debug("STATUS: 0x%08x\n", read_status_mine());
-
-	read_8bytes(0xe64, buf);
-	pr_debug("0x0E64: 0x%08x\n", buf[0]);
-
-	issue_command(0x555, 0x98);
-	for (i = 0; i < 20; i++ ) {
-		pr_debug("%03x: 0x%04x\n", i, read_2bytes_mem(i));
-	}
-	issue_command(0x0, HYPER_FL_RESET_COM);
-	read_8bytes(0x0, buf);
-	pr_debug("8:0x0000 = 0x%08x, 0x%08x\n", buf[1], buf[0]);
-
-}
-
-static void erase_sector(uint32_t sector_addr)
-{
-	int i;
-	u32 status;
-
-	/* Clear status */
-	issue_command(0x555, 0x71);
-	issue_command(0x555, 0xAA);
-	issue_command(0x2AA, 0x55);
-	issue_command(0x555, 0x80);
-	issue_command(0x555, 0xAA);
-	issue_command(0x2AA, 0x55);
-	//issue_command(0x0, HYPER_FL_RESET_COM); /* It works */
-	issue_command(sector_addr>>1, 0x30); /* Why ?  Address ??? */
-	//issue_command(0x555, 0x10); /           It's working, but ... */
-
-	//msleep(1000);
-	i = 0;
-	while (1) {
-		status = read_status_mine();
-		pr_debug("status =  0x%x\n", status);
-		if (status & BIT(7))
-			break;
-		msleep(50);
-		if (i++ == 10) {
-			issue_command(0x0, HYPER_FL_RESET_COM);
-			break;
-		}
-	}
-	pr_debug("End of waiting for the status bit. count = %d\n", i);
-}
-
-
-static void __attribute__ ((unused)) write_test(void)
-{
-	//struct hf_drvdata *dd = (struct hf_drvdata*)dev_get_drvdata(hflash_dev);
-
-	//disable_write_protection();
-	erase_sector(0x00000);
-	//program_word(0x0, 0x0);
-	pr_debug("status = 0x%08x\n", read_status_mine());
-#if 0
-	setup_rpc_clock(dd, 40);
-	write_hwbuf();
-	setup_rpc_clock(dd, 80);
-#endif
 }
 
 static int __attribute__ ((unused)) drvctrl_init(void)
@@ -689,46 +576,13 @@ static int __attribute__ ((unused)) drvctrl_init(void)
 	return 0;
 }
 
-/* External Bus Controller for EX-Bus (LBSC) */
-/*
-[   61.835033] CS0CTRL: 0x00008020
-[   61.838180] CS1CTRL: 0x00000020
-[   61.841325] CSWCR0: 0xff70ff70
-[   61.844372] CSWCR1: 0xff70ff70
-[   61.847431] CSPWCR0: 0x00000000
-[   61.850577] CSPWCR1: 0x00000000
-[   61.853724] EXWTSYNC: 0x00000000
-[   61.856957] CS1GDST: 0x00000000
-*/
-static int __attribute__ ((unused)) lbsc_init(void)
-{
-	void __iomem *virt;
-	
-	virt = ioremap_nocache(0xee220000, 0x1000);
-	if (virt == NULL) {
-		pr_err("Faile to map the LBSC region.\n");
-		return -ENOMEM;
-	}
-
-	iowrite32(0x00000020, virt + 0x0200);
-	iowrite32(0x2A103320, virt + 0x0230);
-	iowrite32(0x2A103320, virt + 0x0234);
-
-	pr_debug("CS0CTRL: 0x%08x\n", ioread32(virt + 0x0200));
-	pr_debug("CS1CTRL: 0x%08x\n", ioread32(virt + 0x0204));
-	pr_debug("CSWCR0: 0x%08x\n", ioread32(virt + 0x0230));
-	pr_debug("CSWCR1: 0x%08x\n", ioread32(virt + 0x0234));
-	pr_debug("CSPWCR0: 0x%08x\n", ioread32(virt + 0x0280));
-	pr_debug("CSPWCR1: 0x%08x\n", ioread32(virt + 0x0284));
-	pr_debug("EXWTSYNC: 0x%08x\n", ioread32(virt + 0x02A0));
-	pr_debug("CS1GDST: 0x%08x\n", ioread32(virt + 0x02C0));
-}
-
 static ssize_t status_show(struct device *dev,
 				struct device_attribute *attr,
 				char *buf)
 {
-	return sprintf(buf, "0x%02x", read_status_mine());
+	u32 status = 0xba;
+	__read_device_status(&status);
+	return sprintf(buf, "0x%02x", status);
 }
 
 static ssize_t bootparam_show(struct device *dev,
@@ -736,10 +590,9 @@ static ssize_t bootparam_show(struct device *dev,
 				char *buf)
 {
 	u32 value;
-	issue_command(0x555, 0x98);
-	if (read_4bytes(0x0, &value))
+	__reset_to_read_mode();
+	if (__read_register_data(0x0, &value, 4))
 		return sprintf(buf, "INVALID");
-	//return sprintf(buf, "0x%08x", cpu_to_be32(value));
 	return sprintf(buf, "0x%08x", value);
 }
 
@@ -749,7 +602,8 @@ static ssize_t ipl_show(struct device *dev,
 {
 	u32 val;
 	int ret;
-	ret = read_4bytes(0x0, &val);
+	__reset_to_read_mode();
+	ret = __read_register_data(0x0, &val, 4);
 	if (ret)
 		return sprintf(buf, "INVALID");
 	if (val & 0x1)
@@ -767,7 +621,7 @@ static ssize_t ipl_store(struct device *dev,
 		//erase_sector(0x0);
 		/* write_word(0x0, 0x0000) */
 	} else if (!strncmp(buf, "B", 1)) {
-		erase_sector(0x0);
+		__erase_sector(0x0);
 		/* write_word(0x0, 0x0001) */
 	} else {
 		dev_dbg(dev, "Invalid arguments: A or B\n");
@@ -791,33 +645,17 @@ static const struct attribute_group hflash_attr_group = {
 	.name = "hflash",
 };
 
-static void testing(struct hf_drvdata *dd)
-{
-	//ret = read_flash_id();
-
-	dump_first_16bytes();
-	dump_flash_memory();
-
-#if 0
-	write_test();
-
-	pr_debug("\n=== after writing ===\n");
-	//ret = read_flash_id();
-	dump_first_16bytes();
-#endif
-}
-
 static int __init hflash_init(void)
 {
 	struct hf_drvdata *dd;
 	struct resource *hf_res;
 	struct device *dev;
+	u32 device_id = 0;
 	int ret;
 
 	/* Hardware configuration */
-#if 1
+#if 0
 	drvctrl_init(); /* Hardware configuration might be OK. */
-	//lbsc_init();
 #endif
 
 	dev = root_device_register("badrpcif");
@@ -831,21 +669,13 @@ static int __init hflash_init(void)
 	if (!dd) {
 		return -ENOMEM;
 	}
-
-#if 0
-	ret = check_mem_region(RPCIF_BASE, RPCIF_SIZE);
-	if (ret) {
-		pr_info("Someone already took the memory region");
-		return ret;
-	}
-#endif
+	dd->dev = dev;
 
 	hf_res = request_mem_region(RPCIF_BASE, RPCIF_SIZE, "rpc-if");
 	if (hf_res == NULL) {
 		pr_err("Failt to aquire the memory region.\n");
 		return -ENODEV;
 	}
-
 
 	dd->io_base = ioremap_nocache(RPCIF_BASE, PAGE_SIZE);
 	if (!dd->io_base) {
@@ -863,11 +693,9 @@ static int __init hflash_init(void)
 	}
 
 
-	//pr_debug("PHYINT = 0x%08x\n", ioread32(dd->io_base + _PHYINT));
-	//iowrite32(0x07070002, dd->io_base + _PHYINT);
 	power_on_rpc_module();
-	//setup_rpc_clock(dd, 80);
-	setup_rpc_clock(dd, 40); /* for debugging */
+	setup_rpc_clock(dd, 80);
+	//setup_rpc_clock(dd, 40); /* for debugging */
 	reset_rpc();
 	check_ssl_delay(hflash_dev);
 
@@ -875,8 +703,6 @@ static int __init hflash_init(void)
 	dev_dbg(dev, "    PHYINT = 0x%08x\n", ioread32(dd->io_base + _PHYINT));
 	dev_dbg(dev, "PHYOFFSET1 = 0x%08x\n", ioread32(dd->io_base + _OFFSET1));
 	dev_dbg(dev, "PHYOFFSET2 = 0x%08x\n", ioread32(dd->io_base + _OFFSET2));
-
-	//issue_command(0x0,HYPER_FL_RESET_COM);
 
 	ret = sysfs_create_group(&dev->kobj, &hflash_attr_group);
 	if (ret) {
@@ -888,7 +714,8 @@ static int __init hflash_init(void)
 		return ret;
 	}
 
-	testing(dd);
+	__read_device_id(&device_id);
+	dev_info(dev, "DEVICE ID: 0x%08x\n", device_id);
 
 	return 0;
 }
