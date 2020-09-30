@@ -22,8 +22,10 @@
 #include <linux/sysfs.h>
 #include <asm/io.h>
 
-#define RPCIF_BASE	0xEE200000UL
-#define RPCIF_SIZE	0x200UL
+#define RPCIF_BASE		0xEE200000
+#define RPCIF_SIZE		0x8100
+#define RPCIF_FLASH_BASE	0x08000000
+#define RPCIF_FLASH_SIZE	0x04000000
 
 #define RPCIF_WRBUF_BASE	0xEE208000
 #define RPCIF_WRBUF_SIZE	(256) /* bytes */
@@ -73,6 +75,9 @@
 struct hf_drvdata {
 	struct device *dev;
 	void __iomem *io_base;
+	void __iomem *flash_base;
+	struct resource *rpc_res;
+	struct resource *flash_res;
 	struct regmap *regmap;
 };
 
@@ -377,9 +382,6 @@ static void __erase_sector(uint32_t sector_addr)
 	issue_command(0x2AA, 0x55);
 	issue_command(sector_addr >> 1, 0x30); /* Problem!!! Why? Address ??? */
 
-	msleep(2000); /* just sleep 2 seconds */
-	return;
-
 	i = 0;
 	while (1) {
 		if (__read_device_status(&status) == 1) { /* Ready */
@@ -451,6 +453,7 @@ static int check_ssl_delay(struct device *dev)
 		dev_dbg(dev, "Setting up SSL delay.\n");
 		regmap_write(dd->regmap, _SSLDR, 0x400);
 	}
+	//regmap_write(dd->regmap, _SSLDR, 0x0000000); no change
 	regmap_read(dd->regmap, _SSLDR, &value);
 	dev_dbg(dev, "SSLDR = 0x%08x\n", value);
 	return 0;
@@ -507,31 +510,38 @@ static void __attribute__ ((unused)) dump_flash_memory(void)
 	iounmap(io_base);
 }
 
-static void _send_word(uint32_t addr, uint32_t data)
+static int __send_word(uint32_t addr, uint32_t data)
 {
 	struct hf_drvdata *dd = (struct hf_drvdata*)dev_get_drvdata(hflash_dev);
-	void __iomem *base = dd->io_base;
 
-	iowrite32(0x80038263, base + _PHYCNT);
-	iowrite32(0x81FFF301, base + _CMNCR);
-	iowrite32(0x00005101, base + _SMDRENR);
-	iowrite32(0xA222540C, base + _SMENR);
+	/* bit9   RCF         =  1 : Read Cache Clear */
+	//regmap_write(dd->regmap, _DRCR, 0x01FF0301);
 
-	iowrite32(0x00000000, base + _SMCMR); /* Write data to memory space */
-	iowrite32(0x00000000, base + _SMOPR); /* CA15-3 = 0 */
+	regmap_write(dd->regmap, _PHYCNT, 0x80038263);
+	regmap_write(dd->regmap, _CMNCR, 0x81FFF301);
 
-	iowrite32(addr, base + _SMADR);
-	iowrite32(data, base + _SMWDR0);
+	/*bit23-21 CMD[7:5] = 000 : CA47-45 = 000 => Write/memory space/WrrapedBrst*/
+	regmap_write(dd->regmap, _SMCMR, 0x00600000);
+	regmap_write(dd->regmap, _SMOPR, 0x00000000); /* CA15-3 = 0 */
+	regmap_write(dd->regmap, _SMADR, 0x00000000);
 
-	iowrite32(0x00000003, base + _SMCR);
+	regmap_write(dd->regmap, _SMWDR0, 0x00000000);
 
-	wait_msg_xfer_end(dd);
+	regmap_write(dd->regmap, _SMDRENR,0x00005101);
+	/* bit3-0 SPIDE[3:0] = 1100 : 32bit transfer */
+	//regmap_write(dd->regmap, _SMENR, 0xA222540C);
+	regmap_write(dd->regmap, _SMENR, 0xA2225408);
+
+	regmap_write(dd->regmap, _SMCR, 0x3);
+
+	return wait_msg_xfer_end(dd);
 }
 
-static void __attribute__ ((unused)) program_word(uint32_t addr, uint32_t data)
+static int __attribute__ ((unused)) program_word(uint32_t addr, uint32_t data)
 {
 	int i;
 	u32 status;
+	int ret;
 
 	disable_write_protection();
 
@@ -539,21 +549,27 @@ static void __attribute__ ((unused)) program_word(uint32_t addr, uint32_t data)
 	issue_command(HYPER_FL_UNLOCK2_ADD, HYPER_FL_UNLOCK2_DATA);
 	issue_command(HYPER_FL_UNLOCK3_ADD, HYPER_FL_WORD_PROGRAM_COM);
 
-	_send_word(addr, data);
+	ret = __send_word(addr, data);
+	if (ret) {
+		pr_debug("[%s] Failed to send data.\n", __func__);
+		return ret;
+	}
 
 	pr_debug("Waiting ....\n");
 	for (i = 0; i < 10; i++) {
 		msleep(100);
 		if (__read_device_status(&status) == 1) { /* Ready */
-			//pr_warn("Reading the device status is failed.\n");
 			break;
 		}
 	}
 	pr_debug("loop count i = %d\n", i);
 	if (i == 10) {
+		//pr_warn("Reading the device status is failed.\n");
 		pr_warn("Reading status bits might be failed. status = 0x%08x\n",
 			status);
+		return -ETIMEDOUT;
 	}
+	return 0;
 }
 
 static int __attribute__ ((unused)) drvctrl_init(void)
@@ -567,25 +583,31 @@ static int __attribute__ ((unused)) drvctrl_init(void)
 		return -ENOMEM;
 	}
 
+#if 0 /* Don't care */
 	iowrite32(~0x33333333, io_base + 0x0000);
 	iowrite32(0x33333333, io_base + 0x0300);
 	iowrite32(~0x33333337, io_base + 0x0000);
 	iowrite32(0x33333337, io_base + 0x0304);
-	//for (i = 0x300; i < 0x360; i += 4) {
-	for (i = 0x300; i < 0x308; i += 4) {
+#endif
+	for (i = 0x300; i < 0x308; i += 4) { /* DRV range: 0x300 ~ 0x360 */
 		pr_debug("DRVCTRL%d: 0x%08x\n", i >> 2, ioread32(io_base + i));
 	}
 
+#if 1
+#if 0
 	iowrite32(~0x00000FFF, io_base + 0x0000);
 	iowrite32(0x00000FFF, io_base + 0x0400);
-#if 0	/* no change */
+	iowrite32(~0x00005FBF, io_base + 0x0000);
+	iowrite32(0x00005FBF, io_base + 0x0440);
+#endif
+#else	/* no change */
 	iowrite32(~0xCFFF9000, io_base + 0x0000);
 	iowrite32(0xCFFF9000, io_base + 0x0400);
+	iowrite32(~0x00005FFF, io_base + 0x0000);
+	iowrite32(0x00005FFF, io_base + 0x0440);
 #endif
 	pr_debug("PUEN0: 0x%08x (Expected: 0x00000FFF)\n",
 		ioread32(io_base + 0x400));
-	iowrite32(~0x00005FFF, io_base + 0x0000);
-	iowrite32(0x00005FFF, io_base + 0x0440);
 	pr_debug("PUD0: 0x%08x (Expected: 0x00005FBF)\n",
 		ioread32(io_base + 0x440));
 
@@ -600,7 +622,7 @@ static ssize_t status_show(struct device *dev,
 {
 	u32 status = 0xba;
 	__read_device_status(&status);
-	return sprintf(buf, "0x%02x", status);
+	return sprintf(buf, "0x%02x\n", status);
 }
 
 static ssize_t bootparam_show(struct device *dev,
@@ -610,8 +632,8 @@ static ssize_t bootparam_show(struct device *dev,
 	u32 value;
 	__set_address_map_mode_on_read();
 	if (__read_register_data(0x0, &value, 4))
-		return sprintf(buf, "INVALID");
-	return sprintf(buf, "0x%08x", value);
+		return sprintf(buf, "INVALID\n");
+	return sprintf(buf, "0x%08x\n", value);
 }
 
 static ssize_t ipl_show(struct device *dev,
@@ -623,10 +645,10 @@ static ssize_t ipl_show(struct device *dev,
 	__set_address_map_mode_on_read();
 	ret = __read_register_data(0x0, &val, 4);
 	if (ret)
-		return sprintf(buf, "INVALID");
+		return sprintf(buf, "INVALID\n");
 	if (val & 0x1)
-		return sprintf(buf, "B");
-	return sprintf(buf, "A");
+		return sprintf(buf, "B\n");
+	return sprintf(buf, "A\n");
 }
 
 static ssize_t ipl_store(struct device *dev,
@@ -635,13 +657,16 @@ static ssize_t ipl_store(struct device *dev,
 				size_t count)
 {
 	if (!strncmp(buf, "A", 1)) {
-		program_word(0x0, 0x0);
+		int ret;
+		ret = program_word(0x0, 0x0);
+		dev_dbg(dev, "Result of word program: %d\n", ret);
 		//erase_sector(0x0);
 		/* write_word(0x0, 0x0000) */
 	} else if (!strncmp(buf, "B", 1)) {
 		__set_address_map_mode_on_read();
 		//issue_command(0x555, 0x71); /* Clear the device status, necessary? */
-		__erase_sector(0x0);
+		//__erase_sector(0x00080000);
+		__erase_sector(0x00000000);
 		/* write_word(0x0, 0x0001) */
 	} else {
 		dev_dbg(dev, "Invalid arguments: A or B\n");
@@ -730,7 +755,7 @@ static const struct attribute_group hflash_attr_group = {
 static int __init hflash_init(void)
 {
 	struct hf_drvdata *dd;
-	struct resource *hf_res;
+	struct resource *res;
 	struct device *dev;
 	u32 device_id = 0;
 	int ret;
@@ -753,13 +778,14 @@ static int __init hflash_init(void)
 	}
 	dd->dev = dev;
 
-	hf_res = request_mem_region(RPCIF_BASE, RPCIF_SIZE, "rpc-if");
-	if (hf_res == NULL) {
-		pr_err("Failt to aquire the memory region.\n");
+	res = request_mem_region(RPCIF_BASE, RPCIF_SIZE, "rpc-if");
+	if (res == NULL) {
+		pr_err("Failed to aquire the memory region.\n");
 		return -ENODEV;
 	}
 
-	dd->io_base = ioremap_nocache(RPCIF_BASE, PAGE_SIZE);
+	dd->rpc_res = res;
+	dd->io_base = ioremap_nocache(res->start, resource_size(res));
 	if (!dd->io_base) {
 		return -ENOMEM;
 	}
@@ -774,10 +800,21 @@ static int __init hflash_init(void)
 		return PTR_ERR(dd->regmap);
 	}
 
+	res = request_mem_region(RPCIF_FLASH_BASE, RPCIF_FLASH_SIZE, "rpc-mmio");
+	if (res == NULL) {
+		pr_err("Failed to aquire the memory region.\n");
+		return -ENODEV;
+	}
+	dd->flash_res = res;
+	dd->flash_base = ioremap_nocache(res->start, resource_size(res));
+	if (!dd->flash_base) {
+		return -ENOMEM;
+	}
+	pr_debug("Hyperflash mapped to 0x%p\n", dd->io_base);
+
 
 	power_on_rpc_module();
-	setup_rpc_clock(dd, 80);
-	//setup_rpc_clock(dd, 40); /* for debugging */
+	setup_rpc_clock(dd, 80); /* 80 MHz */
 	reset_rpc();
 	check_ssl_delay(hflash_dev);
 
@@ -809,8 +846,11 @@ static void __exit hflash_exit(void)
 	pr_debug("Removing the device ...\n");
 	if (dd->io_base)
 		iounmap(dd->io_base);
+	if (dd->flash_base)
+		iounmap(dd->flash_base);
 	sysfs_remove_group(&hflash_dev->kobj, &hflash_attr_group);
-	release_mem_region(RPCIF_BASE, RPCIF_SIZE);
+	release_mem_region(dd->flash_res->start, resource_size(dd->flash_res));
+	release_mem_region(dd->rpc_res->start, resource_size(dd->rpc_res));
 	if (hflash_dev)
 		root_device_unregister(hflash_dev);
 	pr_info("Bye!\n");
