@@ -2,7 +2,6 @@
 
 # Object file(s) to be built
 obj-m := ipl-helper.o
-obj-m += cogent.o
 
 # Path to the directory that contains the Linux kernel source code
 # and the configuration file (.config)
